@@ -12,8 +12,8 @@ use tokio::{sync::{Mutex, oneshot}, time::sleep};
 struct AppState {
     queue: Arc<Mutex<VecDeque<ProxyRequest>>>,
     client: Client,
-    auth_token: Arc<Mutex<AuthToken>>,
-    rate_limit: Arc<Mutex<RateLimit>>, 
+    auth_token: Arc<Mutex<AuthToken>>, 
+    rate_limit: Arc<Mutex<RateLimit>>,
 }
 
 struct ProxyRequest {
@@ -49,7 +49,7 @@ async fn main() {
     let clone = state.clone();
     tokio::spawn(async move { process_queue(clone).await });
 
-    let app = Router::new().route("/*path", any(proxy_handler)).with_state(state);
+    let app = Router::new().without_v07_checks().route("/*", any(proxy_handler)).with_state(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     tracing::info!("Proxy listening on http://{}", addr);
     Server::bind(addr).serve(app.into_make_service()).await.unwrap();
