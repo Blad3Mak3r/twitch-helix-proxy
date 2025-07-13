@@ -7,22 +7,22 @@ import (
 )
 
 func updateRateLimit(h http.Header) {
-	rateMu.Lock()
-	defer rateMu.Unlock()
+	state.RateLimit.Mutex.Lock()
+	defer state.RateLimit.Mutex.Unlock()
 
 	if limit := h.Get("Ratelimit-Limit"); limit != "" {
 		if l, err := strconv.Atoi(limit); err == nil {
-			rateLimit = l
+			state.RateLimit.RateLimit = l
 		}
 	}
 	if remaining := h.Get("Ratelimit-Remaining"); remaining != "" {
 		if r, err := strconv.Atoi(remaining); err == nil {
-			rateRemaining = r
+			state.RateLimit.RateRemaining = r
 		}
 	}
 	if reset := h.Get("Ratelimit-Reset"); reset != "" {
 		if ts, err := strconv.ParseInt(reset, 10, 64); err == nil {
-			rateReset = time.Unix(ts, 0)
+			state.RateLimit.RateReset = time.Unix(ts, 0)
 		}
 	}
 }

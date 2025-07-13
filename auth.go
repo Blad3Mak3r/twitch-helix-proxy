@@ -1,14 +1,18 @@
 package main
 
 import (
+	"encoding/json"
+	"log"
 	"net/http"
 	"time"
 )
 
-func ensureAccessToken() string {
-	if authToken.accessToken != "" && authToken.refreshAt > time.Now().Unix() {
-		return authToken.accessToken
+func EnsureAccessToken() string {
+	if state.AccessToken != "" && state.RefreshAt > time.Now().Unix() {
+		return state.AccessToken
 	}
+
+	log.Println("Fetching AccessToken...")
 
 	req, err := http.NewRequest("POST", "https://id.twitch.tv/oauth2/token", nil)
 	if err != nil {
@@ -16,8 +20,8 @@ func ensureAccessToken() string {
 	}
 
 	q := req.URL.Query()
-	q.Add("client_id", clientCredentials.clientId)
-	q.Add("client_secret", clientCredentials.clientSecret)
+	q.Add("client_id", state.Credentials.ClientId)
+	q.Add("client_secret", state.Credentials.ClientSecret)
 	q.Add("grant_type", "client_credentials")
 	req.URL.RawQuery = q.Encode()
 
@@ -34,8 +38,15 @@ func ensureAccessToken() string {
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 
-	authToken.accessToken = tokenResponse.AccessToken
-	authToken.refreshAt = time.Now().Unix() + tokenResponse.ExpiresIn - 60 // Refresh 1 minute before expiry
-	return authToken.accessToken
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
+		panic("Failed to parse token response: " + err.Error())
+	}
+
+	state.AccessToken = tokenResponse.AccessToken
+	state.RefreshAt = time.Now().Unix() + tokenResponse.ExpiresIn - 60 // Refresh 1 minute before expiry
+
+	log.Printf("New AccessToken stored!\n")
+
+	return state.AccessToken
 
 }

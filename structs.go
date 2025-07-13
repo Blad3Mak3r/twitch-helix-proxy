@@ -1,18 +1,31 @@
 package main
 
-import "net/http"
+import (
+	"net/http"
+	"sync"
+	"time"
+)
 
-type AuthToken struct {
-	accessToken string
-	refreshAt   int64
+type AppState struct {
+	AccessToken string
+	RefreshAt   int64
+	Credentials ClientCredentials
+	RateLimit   RateLimit
 }
 
 type ClientCredentials struct {
-	clientId     string
-	clientSecret string
+	ClientId     string
+	ClientSecret string
 }
 
 type ProxyRequest struct {
-	uri    string
-	client *http.Client
+	Uri    string
+	Client *http.Client
+}
+
+type RateLimit struct {
+	Mutex         sync.Mutex
+	RateLimit     int
+	RateRemaining int
+	RateReset     time.Time
 }

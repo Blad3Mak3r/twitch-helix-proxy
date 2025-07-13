@@ -1,32 +1,53 @@
 package main
 
 import (
+	"fmt"
+	"log"
 	"net/http"
 	"os"
-	"sync"
-	"time"
+	"strconv"
+
+	"github.com/joho/godotenv"
 )
 
 var (
-	authToken         AuthToken
-	clientCredentials ClientCredentials
-	rateMu            sync.Mutex
-	rateLimit         = 800 // default
-	rateRemaining     = 800
-	rateReset         time.Time
+	state *AppState
+
+	port int
 )
 
 func init() {
-	clientCredentials = ClientCredentials{
-		clientId:     os.Getenv("TWITCH_CLIENT_ID"),
-		clientSecret: os.Getenv("TWITCH_CLIENT_SECRET"),
+	err := godotenv.Load(".env")
+	if err != nil {
+		panic("Error loading .env")
+	}
+	if envPort, exists := os.LookupEnv("PORT"); exists == true {
+		if parsedPort, err := strconv.Atoi(envPort); err != nil {
+			panic("Error parsing port")
+		} else {
+			port = parsedPort
+		}
+	} else {
+		port = 4200
 	}
 
-	if clientCredentials.clientId == "" || clientCredentials.clientSecret == "" {
+	state = &AppState{
+		Credentials: ClientCredentials{
+			ClientId:     os.Getenv("TWITCH_CLIENT_ID"),
+			ClientSecret: os.Getenv("TWITCH_CLIENT_SECRET"),
+		},
+	}
+
+	if state.Credentials.ClientId == "" || state.Credentials.ClientSecret == "" {
 		panic("Twitch client ID and secret must be set in environment variables")
 	}
+
+	EnsureAccessToken()
 }
 
 func main() {
-	http.HandleFunc("/", handleProxyRequest)
+	http.HandleFunc("/", HandleProxyRequest)
+
+	log.Printf("Proxy listening on :%d\n", port)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), nil))
 }
