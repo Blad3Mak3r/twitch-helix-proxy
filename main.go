@@ -3,11 +3,17 @@ package main
 import (
 	"net/http"
 	"os"
+	"sync"
+	"time"
 )
 
 var (
 	authToken         AuthToken
 	clientCredentials ClientCredentials
+	rateMu            sync.Mutex
+	rateLimit         = 800 // default
+	rateRemaining     = 800
+	rateReset         time.Time
 )
 
 func init() {
@@ -22,10 +28,5 @@ func init() {
 }
 
 func main() {
-	server := http.NewServeMux()
-	server.HandleFunc("/helix/{path...}", func(w http.ResponseWriter, r *http.Request) {
-		// Handle proxy request here
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Proxy endpoint is working"))
-	})
+	http.HandleFunc("/", handleProxyRequest)
 }
