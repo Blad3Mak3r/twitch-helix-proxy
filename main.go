@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -9,11 +10,147 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// TwitchRateLimiter con detección de versión basada en headers
+// TwitchAuthManager handles authentication and token renewal
+type TwitchAuthManager struct {
+	mu           sync.RWMutex
+	clientID     string
+	clientSecret string
+	accessToken  string
+	expiresAt    time.Time
+	client       *http.Client
+}
+
+type tokenResponse struct {
+	AccessToken string `json:"access_token"`
+	ExpiresIn   int    `json:"expires_in"`
+	TokenType   string `json:"token_type"`
+}
+
+func NewTwitchAuthManager(clientID, clientSecret string) *TwitchAuthManager {
+	am := &TwitchAuthManager{
+		clientID:     clientID,
+		clientSecret: clientSecret,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
+
+	// Get initial token
+	if err := am.refreshToken(); err != nil {
+		log.Fatalf("❌ Error obtaining initial token: %v", err)
+	}
+
+	// Start automatic renewal goroutine
+	go am.autoRefresh()
+
+	return am
+}
+
+// refreshToken obtains a new access token
+func (am *TwitchAuthManager) refreshToken() error {
+	log.Printf("🔑 Requesting new access token...")
+
+	data := url.Values{}
+	data.Set("client_id", am.clientID)
+	data.Set("client_secret", am.clientSecret)
+	data.Set("grant_type", "client_credentials")
+
+	resp, err := am.client.PostForm("https://id.twitch.tv/oauth2/token", data)
+	if err != nil {
+		return fmt.Errorf("request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp tokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return fmt.Errorf("error decoding response: %w", err)
+	}
+
+	am.mu.Lock()
+	am.accessToken = tokenResp.AccessToken
+	// Renew 10 minutes before expiry (safety buffer)
+	renewBuffer := 10 * time.Minute
+	expiryDuration := time.Duration(tokenResp.ExpiresIn) * time.Second
+
+	// If token expires in less than 10 minutes, renew at 20% remaining time
+	if expiryDuration < renewBuffer {
+		renewBuffer = expiryDuration * 20 / 100
+	}
+
+	am.expiresAt = time.Now().Add(expiryDuration - renewBuffer)
+	am.mu.Unlock()
+
+	log.Printf("✅ Token obtained (expires in %d seconds, renewal in %.1f minutes)",
+		tokenResp.ExpiresIn, (expiryDuration - renewBuffer).Minutes())
+	return nil
+}
+
+// autoRefresh automatically renews the token before it expires
+func (am *TwitchAuthManager) autoRefresh() {
+	for {
+		am.mu.RLock()
+		timeUntilExpiry := time.Until(am.expiresAt)
+		am.mu.RUnlock()
+
+		if timeUntilExpiry <= 30*time.Second {
+			// Token is about to expire or already expired, renew immediately
+			if err := am.refreshToken(); err != nil {
+				log.Printf("❌ Error renewing token: %v. Retrying in 10s...", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+		} else {
+			// Wait until it's time to renew
+			log.Printf("⏰ Next token renewal in %.1f minutes", timeUntilExpiry.Minutes())
+			time.Sleep(timeUntilExpiry)
+		}
+	}
+}
+
+// GetAccessToken returns the current token (thread-safe)
+func (am *TwitchAuthManager) GetAccessToken() string {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	return am.accessToken
+}
+
+// ValidateToken verifies if the current token is valid
+func (am *TwitchAuthManager) ValidateToken() error {
+	am.mu.RLock()
+	token := am.accessToken
+	am.mu.RUnlock()
+
+	req, err := http.NewRequest("GET", "https://id.twitch.tv/oauth2/validate", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "OAuth "+token)
+
+	resp, err := am.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("invalid token: status %d", resp.StatusCode)
+	}
+
+	log.Printf("✅ Token validated successfully")
+	return nil
+}
+
+// TwitchRateLimiter with version detection based on headers
 type TwitchRateLimiter struct {
 	mu              sync.RWMutex
 	tokensRemaining int
@@ -21,9 +158,9 @@ type TwitchRateLimiter struct {
 	bucketCapacity  int
 	minBuffer       int
 
-	// Tracking para detectar respuestas viejas
-	lastResetTime   int64 // Unix timestamp del último Ratelimit-Reset visto
-	lowestRemaining int   // El valor más bajo visto en el bucket actual
+	// Tracking to detect stale responses
+	lastResetTime   int64 // Unix timestamp of last seen Ratelimit-Reset
+	lowestRemaining int   // Lowest value seen in current bucket
 }
 
 func NewTwitchRateLimiter() *TwitchRateLimiter {
@@ -38,7 +175,7 @@ func NewTwitchRateLimiter() *TwitchRateLimiter {
 	}
 }
 
-// UpdateFromHeaders actualiza solo si los datos son más recientes
+// UpdateFromHeaders updates only if data is more recent
 func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 	if remaining == "" || reset == "" {
 		return
@@ -57,9 +194,9 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Caso 1: Nueva ventana de rate limit (el reset time cambió)
+	// Case 1: New rate limit window (reset time changed)
 	if resetUnix > rl.lastResetTime {
-		log.Printf("🔄 Nuevo bucket detectado: reset %d → %d", rl.lastResetTime, resetUnix)
+		log.Printf("🔄 New bucket detected: reset %d → %d", rl.lastResetTime, resetUnix)
 		rl.lastResetTime = resetUnix
 		rl.resetTime = time.Unix(resetUnix, 0)
 		rl.tokensRemaining = rem
@@ -71,35 +208,35 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 			}
 		}
 
-		log.Printf("📊 Bucket reseteado: %d/%d tokens disponibles", rem, rl.bucketCapacity)
+		log.Printf("📊 Bucket reset: %d/%d tokens available", rem, rl.bucketCapacity)
 		return
 	}
 
-	// Caso 2: Misma ventana, pero respuesta de request más reciente (remaining menor)
+	// Case 2: Same window, but more recent response (lower remaining)
 	if resetUnix == rl.lastResetTime && rem < rl.lowestRemaining {
-		log.Printf("🔽 Actualización válida: tokens %d → %d (mismo bucket)",
+		log.Printf("🔽 Valid update: tokens %d → %d (same bucket)",
 			rl.tokensRemaining, rem)
 		rl.tokensRemaining = rem
 		rl.lowestRemaining = rem
 		return
 	}
 
-	// Caso 3: Respuesta vieja (remaining mayor que el mínimo visto)
+	// Case 3: Stale response (higher remaining than minimum seen)
 	if resetUnix == rl.lastResetTime && rem > rl.lowestRemaining {
-		log.Printf("⏪ Respuesta vieja ignorada: remaining=%d (actual=%d)",
+		log.Printf("⏪ Stale response ignored: remaining=%d (current=%d)",
 			rem, rl.lowestRemaining)
 		return
 	}
 
-	// Caso 4: Respuesta de bucket anterior (resetUnix < rl.lastResetTime)
+	// Case 4: Response from previous bucket (resetUnix < rl.lastResetTime)
 	if resetUnix < rl.lastResetTime {
-		log.Printf("⏪ Respuesta de bucket antiguo ignorada (reset %d < %d)",
+		log.Printf("⏪ Old bucket response ignored (reset %d < %d)",
 			resetUnix, rl.lastResetTime)
 		return
 	}
 }
 
-// Acquire usa RWMutex para permitir lecturas concurrentes
+// Acquire uses RWMutex to allow concurrent reads
 func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -108,32 +245,32 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 
 		rl.mu.RLock()
 
-		// Check si el bucket se reseteó
+		// Check if bucket has reset
 		now := time.Now()
 		if now.After(rl.resetTime) {
 			rl.mu.RUnlock()
 
-			// Upgrade a write lock para resetear
+			// Upgrade to write lock to reset
 			rl.mu.Lock()
-			// Double-check después de adquirir write lock
+			// Double-check after acquiring write lock
 			if time.Now().After(rl.resetTime) {
 				rl.tokensRemaining = rl.bucketCapacity
 				rl.resetTime = time.Now().Add(time.Minute)
 				rl.lastResetTime = rl.resetTime.Unix()
 				rl.lowestRemaining = rl.bucketCapacity
-				log.Printf("🔄 Bucket auto-reseteado: %d tokens", rl.bucketCapacity)
+				log.Printf("🔄 Bucket auto-reset: %d tokens", rl.bucketCapacity)
 			}
 			rl.mu.Unlock()
 			continue
 		}
 
-		// Si hay tokens suficientes, permitir
+		// If enough tokens available, allow
 		if rl.tokensRemaining > rl.minBuffer {
 			rl.mu.RUnlock()
 
-			// Decrementar con write lock
+			// Decrement with write lock
 			rl.mu.Lock()
-			// Double-check que todavía hay tokens
+			// Double-check tokens are still available
 			if rl.tokensRemaining > rl.minBuffer {
 				rl.tokensRemaining--
 				rl.lowestRemaining = rl.tokensRemaining
@@ -144,20 +281,20 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 			continue
 		}
 
-		// No hay tokens, calcular espera
+		// No tokens, calculate wait time
 		waitUntil := rl.resetTime
 		tokensLeft := rl.tokensRemaining
 		rl.mu.RUnlock()
 
 		waitDuration := time.Until(waitUntil)
 		if waitDuration < 0 {
-			continue // El bucket debería resetearse, reintentar
+			continue // Bucket should reset, retry
 		}
 
-		log.Printf("⏸️  Rate limit: %d tokens restantes, esperando %.1fs hasta reset (%s)",
+		log.Printf("⏸️  Rate limit: %d tokens remaining, waiting %.1fs until reset (%s)",
 			tokensLeft, waitDuration.Seconds(), waitUntil.Format("15:04:05"))
 
-		// Esperar con cancelación
+		// Wait with cancellation
 		timer := time.NewTimer(waitDuration)
 		select {
 		case <-timer.C:
@@ -169,28 +306,26 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 	}
 }
 
-// GetStatus retorna el estado actual
+// GetStatus returns current state
 func (rl *TwitchRateLimiter) GetStatus() (remaining int, resetIn time.Duration) {
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
 	return rl.tokensRemaining, time.Until(rl.resetTime)
 }
 
-// TwitchProxy maneja el proxying con rate limiting concurrente
+// TwitchProxy handles proxying with authentication and rate limiting
 type TwitchProxy struct {
-	clientID    string
-	token       string
+	authManager *TwitchAuthManager
 	rateLimiter *TwitchRateLimiter
 	client      *http.Client
 	targetURL   *url.URL
 }
 
-func NewTwitchProxy(clientID, token string) *TwitchProxy {
+func NewTwitchProxy(clientID, clientSecret string) *TwitchProxy {
 	targetURL, _ := url.Parse("https://api.twitch.tv")
 
 	return &TwitchProxy{
-		clientID:    clientID,
-		token:       token,
+		authManager: NewTwitchAuthManager(clientID, clientSecret),
 		rateLimiter: NewTwitchRateLimiter(),
 		client: &http.Client{
 			Timeout: 30 * time.Second,
@@ -200,20 +335,20 @@ func NewTwitchProxy(clientID, token string) *TwitchProxy {
 }
 
 func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Rate limiting (CONCURRENTE - no serializado)
+	// Rate limiting (concurrent - not serialized)
 	if err := tp.rateLimiter.Acquire(r.Context()); err != nil {
 		http.Error(w, "Request cancelled", http.StatusRequestTimeout)
 		return
 	}
 
-	// Construir URL de Twitch
+	// Build Twitch URL
 	targetURL := *tp.targetURL
 	targetURL.Path = r.URL.Path
 	targetURL.RawQuery = r.URL.RawQuery
 
 	log.Printf("🔄 %s %s", r.Method, targetURL.String())
 
-	// Leer body
+	// Read body
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Error reading request body", http.StatusBadRequest)
@@ -221,7 +356,7 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Hacer petición con reintentos
+	// Make request with retries
 	maxRetries := 3
 	for retry := 0; retry <= maxRetries; retry++ {
 		proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), nil)
@@ -231,11 +366,11 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if len(bodyBytes) > 0 {
-			proxyReq.Body = io.NopCloser(io.Reader(io.LimitReader(io.MultiReader(), int64(len(bodyBytes)))))
+			proxyReq.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 			proxyReq.ContentLength = int64(len(bodyBytes))
 		}
 
-		// Copiar headers
+		// Copy original headers (except Host, Authorization, Client-Id)
 		for key, values := range r.Header {
 			if key != "Host" && key != "Authorization" && key != "Client-Id" {
 				for _, value := range values {
@@ -244,11 +379,10 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Autenticación
-		proxyReq.Header.Set("Client-Id", tp.clientID)
-		proxyReq.Header.Set("Authorization", "Bearer "+tp.token)
+		// Inject current authentication
+		proxyReq.Header.Set("Client-Id", tp.authManager.clientID)
+		proxyReq.Header.Set("Authorization", "Bearer "+tp.authManager.GetAccessToken())
 
-		// Ejecutar petición
 		startTime := time.Now()
 		resp, err := tp.client.Do(proxyReq)
 		if err != nil {
@@ -257,31 +391,45 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		latency := time.Since(startTime)
 
-		// Leer headers de rate limit
+		// Read rate limit headers
 		rateLimitLimit := resp.Header.Get("Ratelimit-Limit")
 		rateLimitRemaining := resp.Header.Get("Ratelimit-Remaining")
 		rateLimitReset := resp.Header.Get("Ratelimit-Reset")
 
-		// Actualizar rate limiter (con detección de versión automática)
+		// Update rate limiter (with automatic version detection)
 		tp.rateLimiter.UpdateFromHeaders(rateLimitRemaining, rateLimitLimit, rateLimitReset)
 
-		// Log con latencia
+		// Log with latency
 		if rateLimitRemaining != "" {
 			remaining, _ := strconv.Atoi(rateLimitRemaining)
 			log.Printf("📊 [%dms] Rate limit: %s/%s tokens (reset: %s)",
 				latency.Milliseconds(), rateLimitRemaining, rateLimitLimit, rateLimitReset)
 
 			if remaining < 100 {
-				log.Printf("⚠️  Solo quedan %d tokens", remaining)
+				log.Printf("⚠️  Only %d tokens remaining", remaining)
 			}
 		}
 
-		// Manejo de 429
+		// If token invalid (401), renew and retry
+		if resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			log.Printf("🔑 Invalid token (401), renewing...")
+
+			if err := tp.authManager.refreshToken(); err != nil {
+				log.Printf("❌ Error renewing token: %v", err)
+				http.Error(w, "Authentication failed", http.StatusUnauthorized)
+				return
+			}
+
+			continue
+		}
+
+		// Handle 429
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
 
 			if retry >= maxRetries {
-				log.Printf("❌ Rate limit 429 después de %d reintentos", maxRetries)
+				log.Printf("❌ Rate limit 429 after %d retries", maxRetries)
 				w.Header().Set("Retry-After", rateLimitReset)
 				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 				return
@@ -303,17 +451,14 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				waitDuration = time.Second * time.Duration(2<<uint(retry))
 			}
 
-			log.Printf("❌ 429 (rate limiting preventivo falló) - Esperando %.1fs",
-				waitDuration.Seconds())
-
-			// Forzar actualización a 0
+			log.Printf("❌ 429 - Waiting %.1fs", waitDuration.Seconds())
 			tp.rateLimiter.UpdateFromHeaders("0", rateLimitLimit, rateLimitReset)
 
 			time.Sleep(waitDuration)
 			continue
 		}
 
-		// Respuesta exitosa
+		// Successful response
 		for key, values := range resp.Header {
 			for _, value := range values {
 				w.Header().Add(key, value)
@@ -337,33 +482,38 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 func statusHandler(proxy *TwitchProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		remaining, resetIn := proxy.rateLimiter.GetStatus()
+
+		proxy.authManager.mu.RLock()
+		tokenExpiry := time.Until(proxy.authManager.expiresAt)
+		proxy.authManager.mu.RUnlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"tokens_remaining":%d,"reset_in_seconds":%.1f}`,
-			remaining, resetIn.Seconds())
+		fmt.Fprintf(w, `{"tokens_remaining":%d,"reset_in_seconds":%.1f,"token_expires_in_seconds":%.1f}`,
+			remaining, resetIn.Seconds(), tokenExpiry.Seconds())
 	}
 }
 
 func main() {
 	clientID := os.Getenv("TWITCH_CLIENT_ID")
-	token := os.Getenv("TWITCH_TOKEN")
+	clientSecret := os.Getenv("TWITCH_CLIENT_SECRET")
 
-	if clientID == "" || token == "" {
-		log.Fatal("❌ TWITCH_CLIENT_ID y TWITCH_TOKEN deben estar configurados")
+	if clientID == "" || clientSecret == "" {
+		log.Fatal("❌ TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET must be set")
 	}
 
-	proxy := NewTwitchProxy(clientID, token)
+	proxy := NewTwitchProxy(clientID, clientSecret)
 
 	http.HandleFunc("/health", healthCheck)
 	http.HandleFunc("/status", statusHandler(proxy))
 	http.Handle("/helix/", proxy)
 
 	addr := ":3000"
-	log.Printf("🚀 Proxy de Twitch corriendo en http://localhost%s", addr)
+	log.Printf("🚀 Twitch proxy running on http://localhost%s", addr)
 	log.Printf("📡 Endpoint: http://localhost%s/helix/...", addr)
 	log.Printf("📊 Status: http://localhost%s/status", addr)
-	log.Printf("⚡ Rate limiting CONCURRENTE con detección de versión")
-	log.Printf("🛡️  Buffer: 50 tokens | Detección automática de respuestas viejas")
+	log.Printf("🔑 Auth: Client Credentials OAuth with automatic renewal")
+	log.Printf("⚡ Concurrent rate limiting with version detection")
 
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
