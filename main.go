@@ -159,8 +159,8 @@ type TwitchRateLimiter struct {
 	minBuffer       int
 
 	// Tracking to detect stale responses
-	lastResetTime   int64 // Unix timestamp of last seen Ratelimit-Reset
-	lowestRemaining int   // Lowest value seen in current bucket
+	bucketID        string // Unique identifier for current bucket (timestamp when we first saw it)
+	lowestRemaining int    // Lowest value seen in current bucket
 }
 
 func NewTwitchRateLimiter() *TwitchRateLimiter {
@@ -170,7 +170,7 @@ func NewTwitchRateLimiter() *TwitchRateLimiter {
 		resetTime:       now.Add(time.Minute),
 		bucketCapacity:  800,
 		minBuffer:       50,
-		lastResetTime:   now.Add(time.Minute).Unix(),
+		bucketID:        fmt.Sprintf("%d", now.Unix()),
 		lowestRemaining: 800,
 	}
 }
@@ -186,7 +186,8 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 		return
 	}
 
-	resetUnix, err := strconv.ParseInt(reset, 10, 64)
+	// Ratelimit-Reset is seconds until reset (not unix timestamp)
+	resetSeconds, err := strconv.Atoi(reset)
 	if err != nil {
 		return
 	}
@@ -194,11 +195,20 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Case 1: New rate limit window (reset time changed)
-	if resetUnix > rl.lastResetTime {
-		log.Printf("🔄 New bucket detected: reset %d → %d", rl.lastResetTime, resetUnix)
-		rl.lastResetTime = resetUnix
-		rl.resetTime = time.Unix(resetUnix, 0)
+	// Calculate when the bucket will reset
+	newResetTime := time.Now().Add(time.Duration(resetSeconds) * time.Second)
+
+	// Check if this is a new bucket (reset time is significantly different)
+	// Allow 2 second tolerance for network delays
+	timeDiff := newResetTime.Sub(rl.resetTime).Abs()
+	isNewBucket := timeDiff > 2*time.Second
+
+	// Case 1: New rate limit window detected
+	if isNewBucket && newResetTime.After(rl.resetTime) {
+		log.Printf("🔄 New bucket detected: reset time %s → %s",
+			rl.resetTime.Format("15:04:05"), newResetTime.Format("15:04:05"))
+		rl.resetTime = newResetTime
+		rl.bucketID = fmt.Sprintf("%d", newResetTime.Unix())
 		rl.tokensRemaining = rem
 		rl.lowestRemaining = rem
 
@@ -212,26 +222,28 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 		return
 	}
 
-	// Case 2: Same window, but more recent response (lower remaining)
-	if resetUnix == rl.lastResetTime && rem < rl.lowestRemaining {
+	// Case 2: Same bucket, more recent response (lower remaining)
+	if !isNewBucket && rem < rl.lowestRemaining {
 		log.Printf("🔽 Valid update: tokens %d → %d (same bucket)",
 			rl.tokensRemaining, rem)
 		rl.tokensRemaining = rem
 		rl.lowestRemaining = rem
+		// Update reset time to keep it accurate
+		rl.resetTime = newResetTime
 		return
 	}
 
 	// Case 3: Stale response (higher remaining than minimum seen)
-	if resetUnix == rl.lastResetTime && rem > rl.lowestRemaining {
+	if !isNewBucket && rem > rl.lowestRemaining {
 		log.Printf("⏪ Stale response ignored: remaining=%d (current=%d)",
 			rem, rl.lowestRemaining)
 		return
 	}
 
-	// Case 4: Response from previous bucket (resetUnix < rl.lastResetTime)
-	if resetUnix < rl.lastResetTime {
-		log.Printf("⏪ Old bucket response ignored (reset %d < %d)",
-			resetUnix, rl.lastResetTime)
+	// Case 4: Response from old bucket (reset time is in the past relative to current)
+	if isNewBucket && newResetTime.Before(rl.resetTime) {
+		log.Printf("⏪ Old bucket response ignored (reset in %ds vs current in %ds)",
+			resetSeconds, int(time.Until(rl.resetTime).Seconds()))
 		return
 	}
 }
@@ -256,7 +268,7 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 			if time.Now().After(rl.resetTime) {
 				rl.tokensRemaining = rl.bucketCapacity
 				rl.resetTime = time.Now().Add(time.Minute)
-				rl.lastResetTime = rl.resetTime.Unix()
+				rl.bucketID = fmt.Sprintf("%d", rl.resetTime.Unix())
 				rl.lowestRemaining = rl.bucketCapacity
 				log.Printf("🔄 Bucket auto-reset: %d tokens", rl.bucketCapacity)
 			}
@@ -437,10 +449,9 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			var waitDuration time.Duration
 			if rateLimitReset != "" {
-				resetTime, err := strconv.ParseInt(rateLimitReset, 10, 64)
+				resetSeconds, err := strconv.Atoi(rateLimitReset)
 				if err == nil {
-					waitUntil := time.Unix(resetTime, 0)
-					waitDuration = time.Until(waitUntil)
+					waitDuration = time.Duration(resetSeconds) * time.Second
 					if waitDuration < 0 {
 						waitDuration = time.Second
 					}
