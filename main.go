@@ -78,20 +78,30 @@ func (am *TwitchAuthManager) refreshToken() error {
 
 	am.mu.Lock()
 	am.accessToken = tokenResp.AccessToken
+	
+	// Calculate actual expiry time
+	expiryDuration := time.Duration(tokenResp.ExpiresIn) * time.Second
+	actualExpiry := time.Now().Add(expiryDuration)
+	
 	// Renew 10 minutes before expiry (safety buffer)
 	renewBuffer := 10 * time.Minute
-	expiryDuration := time.Duration(tokenResp.ExpiresIn) * time.Second
-
+	
 	// If token expires in less than 10 minutes, renew at 20% remaining time
 	if expiryDuration < renewBuffer {
 		renewBuffer = expiryDuration * 20 / 100
 	}
 
-	am.expiresAt = time.Now().Add(expiryDuration - renewBuffer)
+	// Set renewal time (not expiry time!)
+	am.expiresAt = actualExpiry.Add(-renewBuffer)
 	am.mu.Unlock()
 
-	log.Printf("✅ Token obtained (expires in %d seconds, renewal in %.1f minutes)",
-		tokenResp.ExpiresIn, (expiryDuration - renewBuffer).Minutes())
+	timeUntilRenewal := time.Until(am.expiresAt)
+	timeUntilExpiry := time.Until(actualExpiry)
+	
+	log.Printf("✅ Token obtained successfully")
+	log.Printf("   Expires in:  %.1f minutes", timeUntilExpiry.Minutes())
+	log.Printf("   Renewal in:  %.1f minutes (%.1f minutes before expiry)",
+		timeUntilRenewal.Minutes(), renewBuffer.Minutes())
 	return nil
 }
 
@@ -172,8 +182,10 @@ func NewTwitchRateLimiter() *TwitchRateLimiter {
 		resetTime:       now.Add(time.Minute),
 		bucketCapacity:  800,
 		minBuffer:       50,
+		refillRate:      800.0 / 60.0, // ~13.33 tokens/second
 		bucketID:        fmt.Sprintf("%d", now.Unix()),
 		lowestRemaining: 800,
+		lastUpdate:      now,
 	}
 }
 
@@ -199,10 +211,13 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 
 	// Calculate reset time from Unix timestamp
 	newResetTime := time.Unix(resetUnix, 0)
-
+	
 	// Generate bucket ID from reset timestamp
 	newBucketID := fmt.Sprintf("%d", resetUnix)
-
+	
+	// Update last update time
+	rl.lastUpdate = time.Now()
+	
 	// Case 1: New bucket detected (different reset timestamp)
 	if newBucketID != rl.bucketID {
 		// Check if this is actually a newer bucket
@@ -217,13 +232,16 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 			if limit != "" {
 				if lim, err := strconv.Atoi(limit); err == nil {
 					rl.bucketCapacity = lim
+					// Update refill rate based on bucket capacity
+					rl.refillRate = float64(lim) / 60.0
 				}
 			}
 
-			log.Printf("📊 Bucket reset: %d/%d tokens available", rem, rl.bucketCapacity)
+			log.Printf("📊 Bucket reset: %d/%d tokens available (refill: %.2f/s)", 
+				rem, rl.bucketCapacity, rl.refillRate)
 			return
 		}
-
+		
 		// Old bucket response, ignore
 		log.Printf("⏪ Old bucket response ignored (reset %s < current %s)",
 			newResetTime.Format("15:04:05"), rl.resetTime.Format("15:04:05"))
@@ -269,22 +287,39 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 				rl.resetTime = time.Now().Add(time.Minute)
 				rl.bucketID = fmt.Sprintf("%d", rl.resetTime.Unix())
 				rl.lowestRemaining = rl.bucketCapacity
+				rl.lastUpdate = time.Now()
 				log.Printf("🔄 Bucket auto-reset: %d tokens", rl.bucketCapacity)
 			}
 			rl.mu.Unlock()
 			continue
 		}
 
-		// If enough tokens available, allow
-		if rl.tokensRemaining > rl.minBuffer {
+		// Simulate continuous refill based on time elapsed
+		// This is an optimistic local estimation between Twitch updates
+		elapsed := now.Sub(rl.lastUpdate).Seconds()
+		estimatedRefill := int(elapsed * rl.refillRate)
+		estimatedTokens := rl.tokensRemaining + estimatedRefill
+		if estimatedTokens > rl.bucketCapacity {
+			estimatedTokens = rl.bucketCapacity
+		}
+
+		// If estimated tokens are sufficient, allow
+		if estimatedTokens > rl.minBuffer {
 			rl.mu.RUnlock()
 
 			// Decrement with write lock
 			rl.mu.Lock()
-			// Double-check tokens are still available
-			if rl.tokensRemaining > rl.minBuffer {
-				rl.tokensRemaining--
-				rl.lowestRemaining = rl.tokensRemaining
+			// Recalculate with write lock held
+			elapsed = time.Since(rl.lastUpdate).Seconds()
+			estimatedRefill = int(elapsed * rl.refillRate)
+			estimatedTokens = rl.tokensRemaining + estimatedRefill
+			if estimatedTokens > rl.bucketCapacity {
+				estimatedTokens = rl.bucketCapacity
+			}
+
+			if estimatedTokens > rl.minBuffer {
+				// Don't update tokensRemaining here - let Twitch headers be the source of truth
+				// Just record that we made a request
 				rl.mu.Unlock()
 				return nil
 			}
@@ -302,7 +337,7 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 			continue // Bucket should reset, retry
 		}
 
-		log.Printf("⏸️  Rate limit: %d tokens remaining, waiting %.1fs until reset (%s)",
+		log.Printf("⏸️  Rate limit: %d tokens remaining (estimated), waiting %.1fs until reset (%s)",
 			tokensLeft, waitDuration.Seconds(), waitUntil.Format("15:04:05"))
 
 		// Wait with cancellation
@@ -495,13 +530,13 @@ func statusHandler(proxy *TwitchProxy) http.HandlerFunc {
 		remaining, resetIn := proxy.rateLimiter.GetStatus()
 
 		proxy.authManager.mu.RLock()
-		tokenExpiry := time.Until(proxy.authManager.expiresAt)
+		tokenRenewalIn := time.Until(proxy.authManager.expiresAt)
 		proxy.authManager.mu.RUnlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"tokens_remaining":%d,"reset_in_seconds":%.1f,"token_expires_in_seconds":%.1f}`,
-			remaining, resetIn.Seconds(), tokenExpiry.Seconds())
+		fmt.Fprintf(w, `{"tokens_remaining":%d,"reset_in_seconds":%.1f,"token_renewal_in_seconds":%.1f}`,
+			remaining, resetIn.Seconds(), tokenRenewalIn.Seconds())
 	}
 }
 
