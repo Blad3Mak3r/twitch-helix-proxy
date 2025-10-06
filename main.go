@@ -186,8 +186,8 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 		return
 	}
 
-	// Ratelimit-Reset is seconds until reset (not unix timestamp)
-	resetSeconds, err := strconv.Atoi(reset)
+	// Ratelimit-Reset is a Unix epoch timestamp
+	resetUnix, err := strconv.ParseInt(reset, 10, 64)
 	if err != nil {
 		return
 	}
@@ -195,55 +195,52 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Calculate when the bucket will reset
-	newResetTime := time.Now().Add(time.Duration(resetSeconds) * time.Second)
+	// Calculate reset time from Unix timestamp
+	newResetTime := time.Unix(resetUnix, 0)
 
-	// Check if this is a new bucket (reset time is significantly different)
-	// Allow 2 second tolerance for network delays
-	timeDiff := newResetTime.Sub(rl.resetTime).Abs()
-	isNewBucket := timeDiff > 2*time.Second
+	// Generate bucket ID from reset timestamp
+	newBucketID := fmt.Sprintf("%d", resetUnix)
 
-	// Case 1: New rate limit window detected
-	if isNewBucket && newResetTime.After(rl.resetTime) {
-		log.Printf("🔄 New bucket detected: reset time %s → %s",
-			rl.resetTime.Format("15:04:05"), newResetTime.Format("15:04:05"))
-		rl.resetTime = newResetTime
-		rl.bucketID = fmt.Sprintf("%d", newResetTime.Unix())
-		rl.tokensRemaining = rem
-		rl.lowestRemaining = rem
+	// Case 1: New bucket detected (different reset timestamp)
+	if newBucketID != rl.bucketID {
+		// Check if this is actually a newer bucket
+		if newResetTime.After(rl.resetTime) {
+			log.Printf("🔄 New bucket detected: reset %s → %s",
+				rl.resetTime.Format("15:04:05"), newResetTime.Format("15:04:05"))
+			rl.resetTime = newResetTime
+			rl.bucketID = newBucketID
+			rl.tokensRemaining = rem
+			rl.lowestRemaining = rem
 
-		if limit != "" {
-			if lim, err := strconv.Atoi(limit); err == nil {
-				rl.bucketCapacity = lim
+			if limit != "" {
+				if lim, err := strconv.Atoi(limit); err == nil {
+					rl.bucketCapacity = lim
+				}
 			}
+
+			log.Printf("📊 Bucket reset: %d/%d tokens available", rem, rl.bucketCapacity)
+			return
 		}
 
-		log.Printf("📊 Bucket reset: %d/%d tokens available", rem, rl.bucketCapacity)
+		// Old bucket response, ignore
+		log.Printf("⏪ Old bucket response ignored (reset %s < current %s)",
+			newResetTime.Format("15:04:05"), rl.resetTime.Format("15:04:05"))
 		return
 	}
 
 	// Case 2: Same bucket, more recent response (lower remaining)
-	if !isNewBucket && rem < rl.lowestRemaining {
+	if rem < rl.lowestRemaining {
 		log.Printf("🔽 Valid update: tokens %d → %d (same bucket)",
 			rl.tokensRemaining, rem)
 		rl.tokensRemaining = rem
 		rl.lowestRemaining = rem
-		// Update reset time to keep it accurate
-		rl.resetTime = newResetTime
 		return
 	}
 
 	// Case 3: Stale response (higher remaining than minimum seen)
-	if !isNewBucket && rem > rl.lowestRemaining {
+	if rem > rl.lowestRemaining {
 		log.Printf("⏪ Stale response ignored: remaining=%d (current=%d)",
 			rem, rl.lowestRemaining)
-		return
-	}
-
-	// Case 4: Response from old bucket (reset time is in the past relative to current)
-	if isNewBucket && newResetTime.Before(rl.resetTime) {
-		log.Printf("⏪ Old bucket response ignored (reset in %ds vs current in %ds)",
-			resetSeconds, int(time.Until(rl.resetTime).Seconds()))
 		return
 	}
 }
@@ -449,9 +446,10 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			var waitDuration time.Duration
 			if rateLimitReset != "" {
-				resetSeconds, err := strconv.Atoi(rateLimitReset)
+				resetUnix, err := strconv.ParseInt(rateLimitReset, 10, 64)
 				if err == nil {
-					waitDuration = time.Duration(resetSeconds) * time.Second
+					waitUntil := time.Unix(resetUnix, 0)
+					waitDuration = time.Until(waitUntil)
 					if waitDuration < 0 {
 						waitDuration = time.Second
 					}
