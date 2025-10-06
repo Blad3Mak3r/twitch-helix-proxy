@@ -150,17 +150,19 @@ func (am *TwitchAuthManager) ValidateToken() error {
 	return nil
 }
 
-// TwitchRateLimiter with version detection based on headers
+// TwitchRateLimiter with continuous refill token bucket algorithm
 type TwitchRateLimiter struct {
 	mu              sync.RWMutex
 	tokensRemaining int
 	resetTime       time.Time
 	bucketCapacity  int
 	minBuffer       int
+	refillRate      float64 // tokens per second (800/60 = 13.33)
 
 	// Tracking to detect stale responses
-	bucketID        string // Unique identifier for current bucket (timestamp when we first saw it)
+	bucketID        string // Unique identifier for current bucket (reset timestamp)
 	lowestRemaining int    // Lowest value seen in current bucket
+	lastUpdate      time.Time
 }
 
 func NewTwitchRateLimiter() *TwitchRateLimiter {
