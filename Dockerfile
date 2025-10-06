@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.25-alpine AS builder
+FROM golang:1.21-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates tzdata file
@@ -27,7 +27,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     .
 
 # Verify the binary is statically linked
-RUN ldd twitch-proxy 2>&1 | grep -q "not a dynamic executable"
+RUN file twitch-proxy | grep -q "statically linked" || (echo "Binary is not static!" && exit 1)
 
 # Final stage
 FROM scratch
