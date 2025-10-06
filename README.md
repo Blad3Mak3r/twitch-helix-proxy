@@ -57,15 +57,15 @@ docker-compose up -d
 ```bash
 # Clone the repository
 git clone https://github.com/blad3mak3r/twitch-helix-proxy.git
-cd twitch-helix-proxy
+cd twitch-proxy
 
 # Build
-go build -o twitch-helix-proxy .
+go build -o twitch-proxy .
 
 # Run
 export TWITCH_CLIENT_ID=your_client_id
 export TWITCH_CLIENT_SECRET=your_client_secret
-./twitch-helix-proxy
+./twitch-proxy
 ```
 
 ## 📡 Usage
@@ -117,11 +117,11 @@ Response:
 ### Rate Limiting Configuration
 
 The proxy is configured with conservative defaults:
-- **12 requests/second** (720/minute, below Twitch's 800/minute limit)
-- **50 token buffer** (pauses requests when fewer than 50 tokens remain)
-- **10 minute token renewal buffer** (renews OAuth tokens 10 minutes before expiry)
+- **Continuous refill**: Twitch uses a token bucket that refills at ~13.33 tokens/second (800 points/60 seconds)
+- **50 token buffer**: Pauses requests when fewer than 50 tokens remain (conservative safety margin)
+- **10 minute token renewal buffer**: Renews OAuth tokens 10 minutes before expiry
 
-These values can be adjusted in the code if needed for your specific use case.
+The rate limiter uses **optimistic local estimation** between Twitch header updates, simulating the continuous refill. This allows maximum throughput while staying within limits.
 
 ## 🏗️ Architecture
 
