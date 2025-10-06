@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -14,151 +13,6 @@ import (
 	"sync"
 	"time"
 )
-
-// TwitchAuthManager handles authentication and token renewal
-type TwitchAuthManager struct {
-	mu           sync.RWMutex
-	clientID     string
-	clientSecret string
-	accessToken  string
-	expiresAt    time.Time
-	client       *http.Client
-}
-
-type tokenResponse struct {
-	AccessToken string `json:"access_token"`
-	ExpiresIn   int    `json:"expires_in"`
-	TokenType   string `json:"token_type"`
-}
-
-func NewTwitchAuthManager(clientID, clientSecret string) *TwitchAuthManager {
-	am := &TwitchAuthManager{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		client: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-	}
-
-	// Get initial token
-	if err := am.refreshToken(); err != nil {
-		log.Fatalf("❌ Error obtaining initial token: %v", err)
-	}
-
-	// Start automatic renewal goroutine
-	go am.autoRefresh()
-
-	return am
-}
-
-// refreshToken obtains a new access token
-func (am *TwitchAuthManager) refreshToken() error {
-	log.Printf("🔑 Requesting new access token...")
-
-	data := url.Values{}
-	data.Set("client_id", am.clientID)
-	data.Set("client_secret", am.clientSecret)
-	data.Set("grant_type", "client_credentials")
-
-	resp, err := am.client.PostForm("https://id.twitch.tv/oauth2/token", data)
-	if err != nil {
-		return fmt.Errorf("request error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp tokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return fmt.Errorf("error decoding response: %w", err)
-	}
-
-	am.mu.Lock()
-	am.accessToken = tokenResp.AccessToken
-	
-	// Calculate actual expiry time
-	expiryDuration := time.Duration(tokenResp.ExpiresIn) * time.Second
-	actualExpiry := time.Now().Add(expiryDuration)
-	
-	// Renew 10 minutes before expiry (safety buffer)
-	renewBuffer := 10 * time.Minute
-	
-	// If token expires in less than 10 minutes, renew at 20% remaining time
-	if expiryDuration < renewBuffer {
-		renewBuffer = expiryDuration * 20 / 100
-	}
-
-	// Set renewal time (not expiry time!)
-	am.expiresAt = actualExpiry.Add(-renewBuffer)
-	am.mu.Unlock()
-
-	timeUntilRenewal := time.Until(am.expiresAt)
-	timeUntilExpiry := time.Until(actualExpiry)
-	
-	log.Printf("✅ Token obtained successfully")
-	log.Printf("   Expires in:  %.1f minutes", timeUntilExpiry.Minutes())
-	log.Printf("   Renewal in:  %.1f minutes (%.1f minutes before expiry)",
-		timeUntilRenewal.Minutes(), renewBuffer.Minutes())
-	return nil
-}
-
-// autoRefresh automatically renews the token before it expires
-func (am *TwitchAuthManager) autoRefresh() {
-	for {
-		am.mu.RLock()
-		timeUntilExpiry := time.Until(am.expiresAt)
-		am.mu.RUnlock()
-
-		if timeUntilExpiry <= 30*time.Second {
-			// Token is about to expire or already expired, renew immediately
-			if err := am.refreshToken(); err != nil {
-				log.Printf("❌ Error renewing token: %v. Retrying in 10s...", err)
-				time.Sleep(10 * time.Second)
-				continue
-			}
-		} else {
-			// Wait until it's time to renew
-			log.Printf("⏰ Next token renewal in %.1f minutes", timeUntilExpiry.Minutes())
-			time.Sleep(timeUntilExpiry)
-		}
-	}
-}
-
-// GetAccessToken returns the current token (thread-safe)
-func (am *TwitchAuthManager) GetAccessToken() string {
-	am.mu.RLock()
-	defer am.mu.RUnlock()
-	return am.accessToken
-}
-
-// ValidateToken verifies if the current token is valid
-func (am *TwitchAuthManager) ValidateToken() error {
-	am.mu.RLock()
-	token := am.accessToken
-	am.mu.RUnlock()
-
-	req, err := http.NewRequest("GET", "https://id.twitch.tv/oauth2/validate", nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "OAuth "+token)
-
-	resp, err := am.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("invalid token: status %d", resp.StatusCode)
-	}
-
-	log.Printf("✅ Token validated successfully")
-	return nil
-}
 
 // TwitchRateLimiter with continuous refill token bucket algorithm
 type TwitchRateLimiter struct {
@@ -211,13 +65,13 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 
 	// Calculate reset time from Unix timestamp
 	newResetTime := time.Unix(resetUnix, 0)
-	
+
 	// Generate bucket ID from reset timestamp
 	newBucketID := fmt.Sprintf("%d", resetUnix)
-	
+
 	// Update last update time
 	rl.lastUpdate = time.Now()
-	
+
 	// Case 1: New bucket detected (different reset timestamp)
 	if newBucketID != rl.bucketID {
 		// Check if this is actually a newer bucket
@@ -237,11 +91,11 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 				}
 			}
 
-			log.Printf("📊 Bucket reset: %d/%d tokens available (refill: %.2f/s)", 
+			log.Printf("📊 Bucket reset: %d/%d tokens available (refill: %.2f/s)",
 				rem, rl.bucketCapacity, rl.refillRate)
 			return
 		}
-		
+
 		// Old bucket response, ignore
 		log.Printf("⏪ Old bucket response ignored (reset %s < current %s)",
 			newResetTime.Format("15:04:05"), rl.resetTime.Format("15:04:05"))
@@ -425,9 +279,17 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Get a valid token
+		token, err := tp.authManager.GetAccessToken()
+		if err != nil {
+			log.Printf("❌ Error getting access token: %v", err)
+			http.Error(w, "Authentication error", http.StatusInternalServerError)
+			return
+		}
+
 		// Inject current authentication
 		proxyReq.Header.Set("Client-Id", tp.authManager.clientID)
-		proxyReq.Header.Set("Authorization", "Bearer "+tp.authManager.GetAccessToken())
+		proxyReq.Header.Set("Authorization", "Bearer "+token)
 
 		startTime := time.Now()
 		resp, err := tp.client.Do(proxyReq)
