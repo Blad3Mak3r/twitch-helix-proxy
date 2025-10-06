@@ -6,6 +6,12 @@ import (
 	"os"
 )
 
+// main initializes and starts the Twitch Helix API proxy server.
+// It requires TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET environment variables.
+// The server listens on port 3000 and provides three endpoints:
+//   - /health: Health check endpoint
+//   - /status: Proxy status with rate limit and token information
+//   - /helix/*: Proxy to Twitch Helix API
 func main() {
 	clientID := os.Getenv("TWITCH_CLIENT_ID")
 	clientSecret := os.Getenv("TWITCH_CLIENT_SECRET")

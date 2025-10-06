@@ -1,2 +1,25 @@
 /target
 .env
+
+# Go build artifacts
+/twitch-helix-proxy
+twitch-proxy
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test coverage
+*.out
+coverage.html
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
