@@ -2,7 +2,7 @@
 
 A high-performance, production-ready HTTP proxy for the Twitch API with intelligent rate limiting and automatic OAuth token management.
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -166,7 +166,7 @@ The Docker image uses a multi-stage build:
 
 ```dockerfile
 # Stage 1: Build static binary
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25-alpine AS builder
 # ... build process ...
 
 # Stage 2: Minimal runtime
@@ -206,7 +206,7 @@ The proxy provides detailed logs:
 
 ### Prerequisites
 
-- Go 1.21 or higher
+- Go 1.25.1 or higher
 - Docker (optional, for containerization)
 
 ### Build
