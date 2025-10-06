@@ -130,12 +130,13 @@ func (am *TwitchAuthManager) refreshToken() error {
 	expiryDuration := time.Duration(tokenResp.ExpiresIn) * time.Second
 	actualExpiry := time.Now().Add(expiryDuration)
 
-	// Set a minimum renewal buffer of 1 minute and maximum of 1 hour
-	renewBuffer := expiryDuration / 10 // 10% del tiempo total
-	if renewBuffer < time.Minute {
-		renewBuffer = time.Minute
-	} else if renewBuffer > time.Hour {
-		renewBuffer = time.Hour
+	// Set renewal buffer to 30 minutes for tokens that last more than 1 hour
+	// For shorter tokens, use 10% of their duration
+	var renewBuffer time.Duration
+	if expiryDuration > time.Hour {
+		renewBuffer = 30 * time.Minute
+	} else {
+		renewBuffer = max(expiryDuration/10, time.Minute)
 	}
 
 	// Update token info
@@ -145,10 +146,25 @@ func (am *TwitchAuthManager) refreshToken() error {
 	timeUntilRenewal := time.Until(am.expiresAt)
 	timeUntilExpiry := time.Until(actualExpiry)
 
+	// Format durations in a human-readable way
+	var expiryMsg, renewalMsg string
+	if timeUntilExpiry > time.Hour*24 {
+		expiryMsg = fmt.Sprintf("%.1f días", timeUntilExpiry.Hours()/24)
+	} else if timeUntilExpiry > time.Hour {
+		expiryMsg = fmt.Sprintf("%.1f horas", timeUntilExpiry.Hours())
+	} else {
+		expiryMsg = fmt.Sprintf("%.1f minutos", timeUntilExpiry.Minutes())
+	}
+
+	if timeUntilRenewal > time.Hour {
+		renewalMsg = fmt.Sprintf("%.1f horas", timeUntilRenewal.Hours())
+	} else {
+		renewalMsg = fmt.Sprintf("%.1f minutos", timeUntilRenewal.Minutes())
+	}
+
 	log.Printf("✅ Token obtained successfully")
-	log.Printf("   Expires in:  %.1f minutes", timeUntilExpiry.Minutes())
-	log.Printf("   Renewal in:  %.1f minutes (%.1f minutes before expiry)",
-		timeUntilRenewal.Minutes(), renewBuffer.Minutes())
+	log.Printf("   Expires in: %s", expiryMsg)
+	log.Printf("   Renewal in: %s", renewalMsg)
 
 	return nil
 }

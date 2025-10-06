@@ -58,8 +58,22 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
+	// Verificar que el timestamp de reset sea razonable
+	now := time.Now()
+	if resetUnix < now.Unix() {
+		log.Printf("⚠️ Received past reset time, ignoring: %d", resetUnix)
+		return
+	}
+
 	// Calculate reset time from Unix timestamp
 	newResetTime := time.Unix(resetUnix, 0)
+	resetDuration := time.Until(newResetTime)
+
+	// Si el tiempo hasta el reset es mayor a 2 minutos, probablemente hay un error
+	if resetDuration > 2*time.Minute {
+		log.Printf("⚠️ Suspicious reset duration (%.1f minutes), using 1 minute", resetDuration.Minutes())
+		newResetTime = now.Add(time.Minute)
+	}
 
 	// Generate bucket ID from reset timestamp
 	newBucketID := fmt.Sprintf("%d", resetUnix)
@@ -71,8 +85,9 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 	if newBucketID != rl.bucketID {
 		// Check if this is actually a newer bucket
 		if newResetTime.After(rl.resetTime) {
-			log.Printf("🔄 New bucket detected: reset %s → %s",
-				rl.resetTime.Format("15:04:05"), newResetTime.Format("15:04:05"))
+			resetIn := time.Until(newResetTime).Round(time.Second)
+			log.Printf("🔄 New bucket detected: reset in %.0f seconds (%s)",
+				resetIn.Seconds(), newResetTime.Format("15:04:05"))
 			rl.resetTime = newResetTime
 			rl.bucketID = newBucketID
 			rl.tokensRemaining = rem
@@ -92,9 +107,8 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 		}
 
 		// Old bucket response, ignore
-		log.Printf("⏪ Old bucket response ignored (reset %s < current %s)",
-			newResetTime.Format("15:04:05"), rl.resetTime.Format("15:04:05"))
-		return
+		log.Printf("⏪ Old bucket response ignored (reset in %.0f seconds)",
+			time.Until(newResetTime).Seconds())
 	}
 
 	// Case 2: Same bucket, more recent response (lower remaining)

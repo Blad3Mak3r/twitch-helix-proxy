@@ -158,7 +158,7 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 
 			if retry >= maxRetries {
-				log.Printf("❌ Rate limit 429 after %d retries", maxRetries)
+				log.Printf("❌ Rate limit exceeded after %d retries - giving up", maxRetries)
 				w.Header().Set("Retry-After", rateLimitReset)
 				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 				return
@@ -180,7 +180,8 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				waitDuration = time.Second * time.Duration(2<<uint(retry))
 			}
 
-			log.Printf("❌ 429 - Waiting %.1fs", waitDuration.Seconds())
+			log.Printf("⏳ Rate limited (429) - Waiting %.1f seconds before retry %d/%d",
+				waitDuration.Seconds(), retry+1, maxRetries)
 			tp.rateLimiter.UpdateFromHeaders("0", rateLimitLimit, rateLimitReset)
 
 			time.Sleep(waitDuration)
