@@ -46,12 +46,20 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 
 	rem, err := strconv.Atoi(remaining)
 	if err != nil {
+		log.Printf("⚠️ Invalid remaining value: %s", remaining)
+		return
+	}
+
+	// Validate that remaining is non-negative
+	if rem < 0 {
+		log.Printf("⚠️ Negative remaining value: %d", rem)
 		return
 	}
 
 	// Ratelimit-Reset is a Unix epoch timestamp
 	resetUnix, err := strconv.ParseInt(reset, 10, 64)
 	if err != nil {
+		log.Printf("⚠️ Invalid reset timestamp: %s", reset)
 		return
 	}
 
@@ -94,10 +102,12 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 			rl.lowestRemaining = rem
 
 			if limit != "" {
-				if lim, err := strconv.Atoi(limit); err == nil {
+				if lim, err := strconv.Atoi(limit); err == nil && lim > 0 {
 					rl.bucketCapacity = lim
 					// Update refill rate based on bucket capacity
 					rl.refillRate = float64(lim) / 60.0
+				} else if err != nil {
+					log.Printf("⚠️ Invalid limit value: %s", limit)
 				}
 			}
 

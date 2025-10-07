@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -20,7 +20,10 @@ type TwitchProxy struct {
 }
 
 func NewTwitchProxy(clientID, clientSecret string) *TwitchProxy {
-	targetURL, _ := url.Parse("https://api.twitch.tv")
+	targetURL, err := url.Parse("https://api.twitch.tv")
+	if err != nil {
+		log.Fatalf("❌ Failed to parse target URL: %v", err)
+	}
 
 	return &TwitchProxy{
 		authManager: NewTwitchAuthManager(clientID, clientSecret),
@@ -87,7 +90,7 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if len(bodyBytes) > 0 {
-			proxyReq.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+			proxyReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			proxyReq.ContentLength = int64(len(bodyBytes))
 		}
 

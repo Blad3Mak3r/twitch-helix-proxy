@@ -213,13 +213,14 @@ func (am *TwitchAuthManager) autoRefresh() {
 func (am *TwitchAuthManager) GetAccessToken() (string, error) {
 	am.mu.RLock()
 	token := am.accessToken
+	expiresAt := am.expiresAt
 	am.mu.RUnlock()
 
-	// Validate token before returning
-	if err := am.ValidateToken(); err != nil {
-		// Token is invalid, try to refresh
+	// Check if token is about to expire
+	if time.Until(expiresAt) <= 0 {
+		// Token expired or about to expire, refresh it
 		if err := am.refreshToken(); err != nil {
-			return "", fmt.Errorf("failed to refresh invalid token: %w", err)
+			return "", fmt.Errorf("failed to refresh expired token: %w", err)
 		}
 		// Get new token after refresh
 		am.mu.RLock()
