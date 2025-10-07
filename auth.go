@@ -172,7 +172,7 @@ func (am *TwitchAuthManager) refreshToken() error {
 // autoRefresh automatically renews the token before it expires
 func (am *TwitchAuthManager) autoRefresh() {
 	// Usar un ticker para verificaciones periódicas
-	const checkInterval = 30 * time.Second
+	const checkInterval = 5 * time.Minute // Reducido la frecuencia de verificación
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
@@ -186,8 +186,10 @@ func (am *TwitchAuthManager) autoRefresh() {
 		timeUntilExpiry := time.Until(am.expiresAt)
 		am.mu.RUnlock()
 
-		if timeUntilExpiry <= checkInterval {
-			// Token próximo a expirar o ya expirado
+		// Solo renovar si falta menos de 10 minutos (o ya expiró)
+		if timeUntilExpiry <= 10*time.Minute {
+			log.Printf("🔑 Token renewal triggered (expires in %.1f minutes)", timeUntilExpiry.Minutes())
+
 			if err := am.refreshToken(); err != nil {
 				log.Printf("❌ Error renewing token: %v. Retrying in %v...", err, backoff)
 				time.Sleep(backoff)
@@ -202,33 +204,33 @@ func (am *TwitchAuthManager) autoRefresh() {
 
 			// Éxito - resetear backoff
 			backoff = time.Second
+			log.Printf("✅ Token renewed successfully")
 		} else {
-			// Todo está bien, mostrar próxima renovación
-			log.Printf("⏰ Next token check in %.1f minutes", checkInterval.Minutes())
+			// Todo está bien, mostrar próxima verificación
+			if timeUntilExpiry > 24*time.Hour {
+				log.Printf("⏰ Next token check in %.1f minutes (token expires in %.1f days)",
+					checkInterval.Minutes(), timeUntilExpiry.Hours()/24)
+			} else {
+				log.Printf("⏰ Next token check in %.1f minutes (token expires in %.1f hours)",
+					checkInterval.Minutes(), timeUntilExpiry.Hours())
+			}
 		}
 	}
 }
 
-// GetAccessToken returns the current valid token (thread-safe)
-func (am *TwitchAuthManager) GetAccessToken() (string, error) {
+// GetAccessToken returns the current cached token (optimized for high throughput)
+func (am *TwitchAuthManager) GetAccessToken() string {
 	am.mu.RLock()
 	token := am.accessToken
-	expiresAt := am.expiresAt
 	am.mu.RUnlock()
+	return token
+}
 
-	// Check if token is about to expire
-	if time.Until(expiresAt) <= 0 {
-		// Token expired or about to expire, refresh it
-		if err := am.refreshToken(); err != nil {
-			return "", fmt.Errorf("failed to refresh expired token: %w", err)
-		}
-		// Get new token after refresh
-		am.mu.RLock()
-		token = am.accessToken
-		am.mu.RUnlock()
-	}
-
-	return token, nil
+// ForceTokenRefresh forces a token refresh and returns the new token
+// Use this only when you get a 401 from Twitch API
+func (am *TwitchAuthManager) ForceTokenRefresh() error {
+	log.Printf("🔑 Forcing token refresh due to API rejection...")
+	return am.refreshToken()
 }
 
 // ValidateToken verifies if the current token is valid

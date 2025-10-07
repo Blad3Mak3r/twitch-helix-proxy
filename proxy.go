@@ -103,13 +103,8 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Get a valid token
-		token, err := tp.authManager.GetAccessToken()
-		if err != nil {
-			log.Printf("❌ Error getting access token: %v", err)
-			http.Error(w, "Authentication error", http.StatusInternalServerError)
-			return
-		}
+		// Get current token (cached, no validation needed)
+		token := tp.authManager.GetAccessToken()
 
 		// Inject current authentication
 		proxyReq.Header.Set("Client-Id", tp.authManager.clientID)
@@ -147,7 +142,7 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			log.Printf("🔑 Invalid token (401), renewing...")
 
-			if err := tp.authManager.refreshToken(); err != nil {
+			if err := tp.authManager.ForceTokenRefresh(); err != nil {
 				log.Printf("❌ Error renewing token: %v", err)
 				http.Error(w, "Authentication failed", http.StatusUnauthorized)
 				return
