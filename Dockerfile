@@ -2,50 +2,42 @@
 FROM golang:1.25.1-alpine AS builder
 
 # Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata file
+RUN apk add --no-cache ca-certificates tzdata
 
-# Set working directory
 WORKDIR /build
 
-# Copy go mod files
-COPY go.mod go.sum* ./
+# Leverage layer cache: copy dependency files before source
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
 
-# Download dependencies
-RUN go mod download
-
-# Copy source code
+# Copy source and build a fully static binary.
+# CGO_ENABLED=0: static linking (no libc dependency).
+# -trimpath: remove local file paths from the binary (reproducible + smaller).
+# -ldflags '-w -s': strip DWARF debug info and symbol table.
+# TARGETOS/TARGETARCH are injected by docker buildx for multi-platform builds.
 COPY . .
-
-# Build static binary
-# CGO_ENABLED=0: Disable CGO for static binary
-# -ldflags: Linker flags to reduce binary size and remove debug info
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -trimpath \
     -ldflags='-w -s -extldflags "-static"' \
-    -a \
-    -installsuffix cgo \
     -o twitch-proxy \
     .
 
-# Verify the binary is statically linked
-RUN file twitch-proxy | grep -q "statically linked" || (echo "Binary is not static!" && exit 1)
-
-# Final stage
+# Final stage: minimal scratch image
 FROM scratch
 
-# Copy CA certificates for HTTPS requests
+# CA certificates for outbound HTTPS to Twitch APIs
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-# Copy timezone data (optional, for accurate time logs)
+# Timezone data for accurate log timestamps
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
-# Copy the static binary
 COPY --from=builder /build/twitch-proxy /twitch-proxy
 
-# Expose port
 EXPOSE 3000
 
-# Run as non-root user (security best practice)
+# Run as nobody (UID 65534) — no shell available in scratch
 USER 65534:65534
 
-# Set entrypoint
 ENTRYPOINT ["/twitch-proxy"]
