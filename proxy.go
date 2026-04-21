@@ -11,7 +11,8 @@ import (
 	"time"
 )
 
-// TwitchProxy handles proxying with authentication and rate limiting
+// TwitchProxy handles proxying requests to the Twitch Helix API with
+// authentication injection, rate limiting, and automatic retry logic.
 type TwitchProxy struct {
 	authManager *TwitchAuthManager
 	rateLimiter *TwitchRateLimiter
@@ -26,7 +27,7 @@ func NewTwitchProxy(clientID, clientSecret string) *TwitchProxy {
 	}
 
 	return &TwitchProxy{
-		authManager: NewTwitchAuthManager(clientID, clientSecret),
+		authManager: NewTwitchAuthManager(serverContext, clientID, clientSecret),
 		rateLimiter: NewTwitchRateLimiter(),
 		client: &http.Client{
 			Timeout: 30 * time.Second,
@@ -35,21 +36,18 @@ func NewTwitchProxy(clientID, clientSecret string) *TwitchProxy {
 	}
 }
 
-// HealthCheck endpoint returns status ok
+// HealthCheck endpoint returns {"status":"ok"}.
 func HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"ok"}`)
 }
 
-// StatusHandler returns current proxy status
+// StatusHandler returns current proxy status without exposing internal mutexes.
 func StatusHandler(proxy *TwitchProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		remaining, resetIn := proxy.rateLimiter.GetStatus()
-
-		proxy.authManager.mu.RLock()
-		tokenRenewalIn := time.Until(proxy.authManager.expiresAt)
-		proxy.authManager.mu.RUnlock()
+		tokenRenewalIn := proxy.authManager.TokenExpiresIn()
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -59,20 +57,23 @@ func StatusHandler(proxy *TwitchProxy) http.HandlerFunc {
 }
 
 func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Rate limiting (concurrent - not serialized)
-	if err := tp.rateLimiter.Acquire(r.Context()); err != nil {
+	ctx := r.Context()
+
+	// Acquire a rate limit token before touching Twitch. This blocks until a
+	// token is available or the client disconnects (ctx cancelled).
+	if err := tp.rateLimiter.Acquire(ctx); err != nil {
 		http.Error(w, "Request cancelled", http.StatusRequestTimeout)
 		return
 	}
 
-	// Build Twitch URL
+	// Build Twitch URL preserving path and query string.
 	targetURL := *tp.targetURL
 	targetURL.Path = r.URL.Path
 	targetURL.RawQuery = r.URL.RawQuery
 
 	log.Printf("🔄 %s %s", r.Method, targetURL.String())
 
-	// Read body
+	// Buffer the body once so we can replay it on retries.
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Error reading request body", http.StatusBadRequest)
@@ -80,10 +81,14 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Make request with retries
-	maxRetries := 3
-	for retry := 0; retry <= maxRetries; retry++ {
-		proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), nil)
+	// Separate retry counters so a cascade of 401→refresh→401 cannot burn
+	// through the 429 budget, and vice-versa.
+	const maxAuthRetries = 2
+	const maxRateRetries = 3
+	authRetries := 0
+
+	for attempt := 0; attempt <= maxRateRetries; attempt++ {
+		proxyReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), nil)
 		if err != nil {
 			http.Error(w, "Error creating request", http.StatusInternalServerError)
 			return
@@ -94,21 +99,18 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			proxyReq.ContentLength = int64(len(bodyBytes))
 		}
 
-		// Copy original headers (except Host, Authorization, Client-Id)
+		// Forward original headers, replacing auth with our managed credentials.
 		for key, values := range r.Header {
-			if key != "Host" && key != "Authorization" && key != "Client-Id" {
-				for _, value := range values {
-					proxyReq.Header.Add(key, value)
-				}
+			if key == "Host" || key == "Authorization" || key == "Client-Id" {
+				continue
+			}
+			for _, value := range values {
+				proxyReq.Header.Add(key, value)
 			}
 		}
 
-		// Get current token (cached, no validation needed)
-		token := tp.authManager.GetAccessToken()
-
-		// Inject current authentication
 		proxyReq.Header.Set("Client-Id", tp.authManager.clientID)
-		proxyReq.Header.Set("Authorization", "Bearer "+token)
+		proxyReq.Header.Set("Authorization", "Bearer "+tp.authManager.GetAccessToken())
 
 		startTime := time.Now()
 		resp, err := tp.client.Do(proxyReq)
@@ -118,85 +120,110 @@ func (tp *TwitchProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		latency := time.Since(startTime)
 
-		// Read rate limit headers
 		rateLimitLimit := resp.Header.Get("Ratelimit-Limit")
 		rateLimitRemaining := resp.Header.Get("Ratelimit-Remaining")
 		rateLimitReset := resp.Header.Get("Ratelimit-Reset")
 
-		// Update rate limiter (with automatic version detection)
 		tp.rateLimiter.UpdateFromHeaders(rateLimitRemaining, rateLimitLimit, rateLimitReset)
 
-		// Log with latency
 		if rateLimitRemaining != "" {
 			remaining, _ := strconv.Atoi(rateLimitRemaining)
 			log.Printf("📊 [%dms] Rate limit: %s/%s tokens (reset: %s)",
 				latency.Milliseconds(), rateLimitRemaining, rateLimitLimit, rateLimitReset)
-
 			if remaining < 100 {
 				log.Printf("⚠️  Only %d tokens remaining", remaining)
 			}
 		}
 
-		// If token invalid (401), renew and retry
-		if resp.StatusCode == http.StatusUnauthorized {
-			resp.Body.Close()
-			log.Printf("🔑 Invalid token (401), renewing...")
+		switch resp.StatusCode {
 
-			if err := tp.authManager.ForceTokenRefresh(); err != nil {
+		case http.StatusUnauthorized:
+			// 401: token was rejected — refresh once, then retry.
+			resp.Body.Close()
+			if authRetries >= maxAuthRetries {
+				log.Printf("❌ Token refresh failed after %d attempts", maxAuthRetries)
+				http.Error(w, "Authentication failed", http.StatusUnauthorized)
+				return
+			}
+			authRetries++
+			log.Printf("🔑 Invalid token (401), renewing (attempt %d/%d)...", authRetries, maxAuthRetries)
+			if err := tp.authManager.ForceTokenRefresh(ctx); err != nil {
 				log.Printf("❌ Error renewing token: %v", err)
 				http.Error(w, "Authentication failed", http.StatusUnauthorized)
 				return
 			}
-
+			// Do not increment attempt — this retry doesn't count against the rate limit budget.
+			attempt--
 			continue
-		}
 
-		// Handle 429
-		if resp.StatusCode == http.StatusTooManyRequests {
+		case http.StatusTooManyRequests:
+			// 429: back off until Twitch's reset timestamp, then retry.
 			resp.Body.Close()
-
-			if retry >= maxRetries {
-				log.Printf("❌ Rate limit exceeded after %d retries - giving up", maxRetries)
+			if attempt >= maxRateRetries {
+				log.Printf("❌ Rate limit exceeded after %d retries - giving up", maxRateRetries)
 				w.Header().Set("Retry-After", rateLimitReset)
 				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}
 
-			var waitDuration time.Duration
-			if rateLimitReset != "" {
-				resetUnix, err := strconv.ParseInt(rateLimitReset, 10, 64)
-				if err == nil {
-					waitUntil := time.Unix(resetUnix, 0)
-					waitDuration = time.Until(waitUntil)
-					if waitDuration < 0 {
-						waitDuration = time.Second
-					}
-				} else {
-					waitDuration = time.Second * time.Duration(2<<uint(retry))
-				}
-			} else {
-				waitDuration = time.Second * time.Duration(2<<uint(retry))
-			}
+			waitDuration := backoffFromReset(rateLimitReset, attempt)
+			log.Printf("⏳ Rate limited (429) - waiting %.1fs before retry %d/%d",
+				waitDuration.Seconds(), attempt+1, maxRateRetries)
 
-			log.Printf("⏳ Rate limited (429) - Waiting %.1f seconds before retry %d/%d",
-				waitDuration.Seconds(), retry+1, maxRetries)
 			tp.rateLimiter.UpdateFromHeaders("0", rateLimitLimit, rateLimitReset)
 
-			time.Sleep(waitDuration)
+			// Respect context cancellation during the wait.
+			timer := time.NewTimer(waitDuration)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				http.Error(w, "Request cancelled", http.StatusRequestTimeout)
+				return
+			}
 			continue
-		}
 
-		// Successful response
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
+		case http.StatusServiceUnavailable:
+			// 503: Twitch docs say "retry once".
+			resp.Body.Close()
+			if attempt >= 1 {
+				log.Printf("❌ Twitch service unavailable after retry")
+				http.Error(w, "Twitch service unavailable", http.StatusBadGateway)
+				return
+			}
+			log.Printf("⚠️  Twitch 503 - retrying once per API docs")
+			continue
+
+		default:
+			// Success or non-retryable error — stream the response back.
+			defer resp.Body.Close()
+			for key, values := range resp.Header {
+				for _, value := range values {
+					w.Header().Add(key, value)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				// Headers already written; log but don't write another error.
+				log.Printf("⚠️  Error streaming response body: %v", err)
+			}
+			return
+		}
+	}
+}
+
+// backoffFromReset calculates how long to wait before the next retry after a 429.
+// It uses the Ratelimit-Reset header (Unix epoch) when available, falling back to
+// exponential backoff (2s, 4s, 8s…).
+func backoffFromReset(rateLimitReset string, attempt int) time.Duration {
+	if rateLimitReset != "" {
+		if resetUnix, err := strconv.ParseInt(rateLimitReset, 10, 64); err == nil {
+			d := time.Until(time.Unix(resetUnix, 0))
+			if d > 0 {
+				return d
 			}
 		}
-
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		resp.Body.Close()
-
-		return
 	}
+	// Exponential backoff: 2<<0=2, 2<<1=4, 2<<2=8 seconds.
+	return time.Second * time.Duration(2<<uint(attempt))
 }

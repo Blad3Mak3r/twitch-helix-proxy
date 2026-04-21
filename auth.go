@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-// TwitchAuthManager handles authentication and token renewal
+// TwitchAuthManager handles OAuth client-credentials token lifecycle.
+// It is safe for concurrent use — all exported methods acquire the mutex.
 type TwitchAuthManager struct {
 	mu           sync.RWMutex
 	clientID     string
@@ -29,7 +30,7 @@ type tokenResponse struct {
 	TokenType   string `json:"token_type"`
 }
 
-// TwitchError representa un error específico de la API de Twitch
+// TwitchError represents a specific Twitch API error.
 type TwitchError struct {
 	Status  int
 	Message string
@@ -47,8 +48,11 @@ func (e *TwitchError) Unwrap() error {
 	return e.Err
 }
 
-// NewTwitchAuthManager creates a new auth manager instance
-func NewTwitchAuthManager(clientID, clientSecret string) *TwitchAuthManager {
+// NewTwitchAuthManager creates a new auth manager, fetches the initial token,
+// and starts the background auto-refresh goroutine.
+// The provided ctx controls the lifetime of the refresh goroutine — cancel it
+// to perform a clean shutdown.
+func NewTwitchAuthManager(ctx context.Context, clientID, clientSecret string) *TwitchAuthManager {
 	am := &TwitchAuthManager{
 		clientID:     clientID,
 		clientSecret: clientSecret,
@@ -57,23 +61,21 @@ func NewTwitchAuthManager(clientID, clientSecret string) *TwitchAuthManager {
 		},
 	}
 
-	// Get initial token
-	if err := am.refreshToken(); err != nil {
+	if err := am.refreshToken(ctx); err != nil {
 		log.Fatalf("❌ Error obtaining initial token: %v", err)
 	}
 
-	// Start automatic renewal goroutine
-	go am.autoRefresh()
+	go am.autoRefresh(ctx)
 
 	return am
 }
 
-// refreshToken obtains a new access token
-func (am *TwitchAuthManager) refreshToken() error {
+// refreshToken fetches a fresh access token from the Twitch OAuth endpoint.
+// It is safe to call concurrently — the mutex is held only while writing.
+func (am *TwitchAuthManager) refreshToken(ctx context.Context) error {
 	log.Printf("🔑 Requesting new access token...")
 
-	// Crear un contexto con timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
 	data := url.Values{}
@@ -81,7 +83,8 @@ func (am *TwitchAuthManager) refreshToken() error {
 	data.Set("client_secret", am.clientSecret)
 	data.Set("grant_type", "client_credentials")
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://id.twitch.tv/oauth2/token", strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost,
+		"https://id.twitch.tv/oauth2/token", strings.NewReader(data.Encode()))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -99,7 +102,6 @@ func (am *TwitchAuthManager) refreshToken() error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		// Intentar decodificar el error de Twitch
 		var twitchErr struct {
 			Status  int    `json:"status"`
 			Message string `json:"message"`
@@ -115,7 +117,6 @@ func (am *TwitchAuthManager) refreshToken() error {
 		return fmt.Errorf("error decoding response: %w", err)
 	}
 
-	// Validar la respuesta
 	if tokenResp.AccessToken == "" {
 		return fmt.Errorf("received empty access token")
 	}
@@ -126,12 +127,9 @@ func (am *TwitchAuthManager) refreshToken() error {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 
-	// Calculate actual expiry time
 	expiryDuration := time.Duration(tokenResp.ExpiresIn) * time.Second
 	actualExpiry := time.Now().Add(expiryDuration)
 
-	// Set renewal buffer to 30 minutes for tokens that last more than 1 hour
-	// For shorter tokens, use 10% of their duration
 	var renewBuffer time.Duration
 	if expiryDuration > time.Hour {
 		renewBuffer = 30 * time.Minute
@@ -139,20 +137,19 @@ func (am *TwitchAuthManager) refreshToken() error {
 		renewBuffer = max(expiryDuration/10, time.Minute)
 	}
 
-	// Update token info
 	am.accessToken = tokenResp.AccessToken
 	am.expiresAt = actualExpiry.Add(-renewBuffer)
 
 	timeUntilRenewal := time.Until(am.expiresAt)
 	timeUntilExpiry := time.Until(actualExpiry)
 
-	// Format durations in a human-readable way
 	var expiryMsg, renewalMsg string
-	if timeUntilExpiry > time.Hour*24 {
+	switch {
+	case timeUntilExpiry > time.Hour*24:
 		expiryMsg = fmt.Sprintf("%.1f días", timeUntilExpiry.Hours()/24)
-	} else if timeUntilExpiry > time.Hour {
+	case timeUntilExpiry > time.Hour:
 		expiryMsg = fmt.Sprintf("%.1f horas", timeUntilExpiry.Hours())
-	} else {
+	default:
 		expiryMsg = fmt.Sprintf("%.1f minutos", timeUntilExpiry.Minutes())
 	}
 
@@ -169,44 +166,30 @@ func (am *TwitchAuthManager) refreshToken() error {
 	return nil
 }
 
-// autoRefresh automatically renews the token before it expires
-func (am *TwitchAuthManager) autoRefresh() {
-	// Usar un ticker para verificaciones periódicas
-	const checkInterval = 5 * time.Minute // Reducido la frecuencia de verificación
+// autoRefresh polls every 5 minutes and renews the token when it is within
+// 10 minutes of the renewal deadline. It exits cleanly when ctx is cancelled.
+func (am *TwitchAuthManager) autoRefresh(ctx context.Context) {
+	const checkInterval = 5 * time.Minute
+
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
 	backoff := time.Second
-	maxBackoff := time.Minute * 5
+	const maxBackoff = 5 * time.Minute
 
 	for {
-		<-ticker.C
+		select {
+		case <-ctx.Done():
+			log.Printf("🔑 Auth manager shutting down")
+			return
+		case <-ticker.C:
+		}
 
 		am.mu.RLock()
 		timeUntilExpiry := time.Until(am.expiresAt)
 		am.mu.RUnlock()
 
-		// Solo renovar si falta menos de 10 minutos (o ya expiró)
-		if timeUntilExpiry <= 10*time.Minute {
-			log.Printf("🔑 Token renewal triggered (expires in %.1f minutes)", timeUntilExpiry.Minutes())
-
-			if err := am.refreshToken(); err != nil {
-				log.Printf("❌ Error renewing token: %v. Retrying in %v...", err, backoff)
-				time.Sleep(backoff)
-
-				// Incrementar backoff exponencialmente
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-				continue
-			}
-
-			// Éxito - resetear backoff
-			backoff = time.Second
-			log.Printf("✅ Token renewed successfully")
-		} else {
-			// Todo está bien, mostrar próxima verificación
+		if timeUntilExpiry > 10*time.Minute {
 			if timeUntilExpiry > 24*time.Hour {
 				log.Printf("⏰ Next token check in %.1f minutes (token expires in %.1f days)",
 					checkInterval.Minutes(), timeUntilExpiry.Hours()/24)
@@ -214,32 +197,66 @@ func (am *TwitchAuthManager) autoRefresh() {
 				log.Printf("⏰ Next token check in %.1f minutes (token expires in %.1f hours)",
 					checkInterval.Minutes(), timeUntilExpiry.Hours())
 			}
+			continue
 		}
+
+		log.Printf("🔑 Token renewal triggered (expires in %.1f minutes)", timeUntilExpiry.Minutes())
+
+		if err := am.refreshToken(ctx); err != nil {
+			log.Printf("❌ Error renewing token: %v. Retrying in %v...", err, backoff)
+
+			// Wait with backoff, but honour context cancellation.
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				log.Printf("🔑 Auth manager shutting down during backoff")
+				return
+			case <-timer.C:
+			}
+
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+
+		backoff = time.Second
+		log.Printf("✅ Token renewed successfully")
 	}
 }
 
-// GetAccessToken returns the current cached token (optimized for high throughput)
+// GetAccessToken returns the current cached token.
+// Optimised for high-throughput — uses RLock only.
 func (am *TwitchAuthManager) GetAccessToken() string {
 	am.mu.RLock()
-	token := am.accessToken
-	am.mu.RUnlock()
-	return token
+	defer am.mu.RUnlock()
+	return am.accessToken
 }
 
-// ForceTokenRefresh forces a token refresh and returns the new token
-// Use this only when you get a 401 from Twitch API
-func (am *TwitchAuthManager) ForceTokenRefresh() error {
+// TokenExpiresIn returns the duration until the token renewal deadline.
+// Used by the /status endpoint to avoid exposing the mutex.
+func (am *TwitchAuthManager) TokenExpiresIn() time.Duration {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	return time.Until(am.expiresAt)
+}
+
+// ForceTokenRefresh forces a token refresh.
+// Use this only when the Twitch API returns 401.
+func (am *TwitchAuthManager) ForceTokenRefresh(ctx context.Context) error {
 	log.Printf("🔑 Forcing token refresh due to API rejection...")
-	return am.refreshToken()
+	return am.refreshToken(ctx)
 }
 
-// ValidateToken verifies if the current token is valid
-func (am *TwitchAuthManager) ValidateToken() error {
+// ValidateToken verifies the current token against the Twitch introspection endpoint.
+func (am *TwitchAuthManager) ValidateToken(ctx context.Context) error {
 	am.mu.RLock()
 	token := am.accessToken
 	am.mu.RUnlock()
 
-	req, err := http.NewRequest("GET", "https://id.twitch.tv/oauth2/validate", nil)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://id.twitch.tv/oauth2/validate", nil)
 	if err != nil {
 		return fmt.Errorf("failed to create validation request: %w", err)
 	}
