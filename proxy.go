@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -20,14 +21,14 @@ type TwitchProxy struct {
 	targetURL   *url.URL
 }
 
-func NewTwitchProxy(clientID, clientSecret string) *TwitchProxy {
+func NewTwitchProxy(ctx context.Context, clientID, clientSecret string) *TwitchProxy {
 	targetURL, err := url.Parse("https://api.twitch.tv")
 	if err != nil {
 		log.Fatalf("❌ Failed to parse target URL: %v", err)
 	}
 
 	return &TwitchProxy{
-		authManager: NewTwitchAuthManager(serverContext, clientID, clientSecret),
+		authManager: NewTwitchAuthManager(ctx, clientID, clientSecret),
 		rateLimiter: NewTwitchRateLimiter(),
 		client: &http.Client{
 			Timeout: 30 * time.Second,
