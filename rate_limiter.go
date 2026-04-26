@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -15,6 +15,8 @@ import (
 // allow requests. We use a plain Mutex (not RWMutex) because every Acquire call
 // that succeeds must mutate state — an RLock→Lock upgrade is always a TOCTOU
 // race and provides no real throughput benefit for this workload.
+//
+// TwitchRateLimiter implements the Limiter interface.
 type TwitchRateLimiter struct {
 	mu              sync.Mutex
 	tokensRemaining int
@@ -25,6 +27,8 @@ type TwitchRateLimiter struct {
 	lastUpdate      time.Time
 }
 
+// NewTwitchRateLimiter creates a rate limiter seeded with Twitch's default
+// global bucket of 800 requests per minute.
 func NewTwitchRateLimiter() *TwitchRateLimiter {
 	now := time.Now()
 	return &TwitchRateLimiter{
@@ -37,27 +41,31 @@ func NewTwitchRateLimiter() *TwitchRateLimiter {
 	}
 }
 
-// UpdateFromHeaders updates the rate limiter state from Twitch API response headers.
-// Twitch provides: Ratelimit-Remaining, Ratelimit-Limit, Ratelimit-Reset (Unix epoch).
-func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
+// UpdateFromHeaders implements Limiter. It updates rate limiter state from the
+// Twitch response headers Ratelimit-Remaining, Ratelimit-Limit, and Ratelimit-Reset.
+func (rl *TwitchRateLimiter) UpdateFromHeaders(h http.Header) {
+	remaining := h.Get("Ratelimit-Remaining")
+	limit := h.Get("Ratelimit-Limit")
+	reset := h.Get("Ratelimit-Reset")
+
 	if remaining == "" || reset == "" {
 		return
 	}
 
 	rem, err := strconv.Atoi(remaining)
 	if err != nil {
-		log.Printf("⚠️ Invalid remaining value: %s", remaining)
+		logger.Warn("invalid Ratelimit-Remaining value", "value", remaining)
 		return
 	}
 
 	if rem < 0 {
-		log.Printf("⚠️ Negative remaining value: %d", rem)
+		logger.Warn("negative Ratelimit-Remaining value", "value", rem)
 		return
 	}
 
 	resetUnix, err := strconv.ParseInt(reset, 10, 64)
 	if err != nil {
-		log.Printf("⚠️ Invalid reset timestamp: %s", reset)
+		logger.Warn("invalid Ratelimit-Reset timestamp", "value", reset)
 		return
 	}
 
@@ -70,8 +78,9 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 	// Reject timestamps that are too far in the past (more than 5 seconds).
 	// This protects against stale/out-of-order responses.
 	if newResetTime.Before(now.Add(-5 * time.Second)) {
-		log.Printf("⚠️ Received past reset time, ignoring: %d (%.1f seconds ago)",
-			resetUnix, now.Sub(newResetTime).Seconds())
+		logger.Warn("received stale Ratelimit-Reset, ignoring",
+			"reset_unix", resetUnix,
+			"seconds_ago", now.Sub(newResetTime).Seconds())
 		return
 	}
 
@@ -87,14 +96,15 @@ func (rl *TwitchRateLimiter) UpdateFromHeaders(remaining, limit, reset string) {
 	rl.resetTime = newResetTime
 	rl.lastUpdate = now
 
-	resetIn := time.Until(newResetTime).Round(time.Second)
 	if oldRemaining != rem {
-		log.Printf("🔄 Rate limit updated: %d → %d tokens (reset in %.0f seconds)",
-			oldRemaining, rem, resetIn.Seconds())
+		logger.Debug("global rate limit updated",
+			"tokens_before", oldRemaining,
+			"tokens_after", rem,
+			"reset_in_seconds", time.Until(newResetTime).Round(time.Second).Seconds())
 	}
 }
 
-// Acquire blocks until a token is available or ctx is cancelled.
+// Acquire implements Limiter. It blocks until a token is available or ctx is cancelled.
 //
 // Uses a single Mutex to avoid the TOCTOU race of RLock→Lock upgrades.
 // Local token estimation between Twitch header updates keeps the limiter
@@ -115,7 +125,7 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 			rl.tokensRemaining = rl.bucketCapacity
 			rl.resetTime = now.Add(time.Minute)
 			rl.lastUpdate = now
-			log.Printf("🔄 Bucket auto-reset: %d tokens", rl.bucketCapacity)
+			logger.Debug("global bucket auto-reset", "tokens", rl.bucketCapacity)
 		}
 
 		// Optimistic local estimation: add tokens accrued since last Twitch update.
@@ -145,8 +155,10 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 			continue
 		}
 
-		log.Printf("⏸️  Rate limit: %d tokens remaining, waiting %.1fs until reset (%s)",
-			tokensLeft, waitDuration.Seconds(), waitUntil.Format("15:04:05"))
+		logger.Warn("global rate limit exhausted, waiting for reset",
+			"tokens_remaining", tokensLeft,
+			"wait_seconds", waitDuration.Seconds(),
+			"reset_at", waitUntil.Format("15:04:05"))
 
 		// Wait with context cancellation support — no bare time.Sleep.
 		timer := time.NewTimer(waitDuration)
@@ -160,9 +172,20 @@ func (rl *TwitchRateLimiter) Acquire(ctx context.Context) error {
 	}
 }
 
-// GetStatus returns current rate limit state for the /status endpoint.
-func (rl *TwitchRateLimiter) GetStatus() (remaining int, resetIn time.Duration) {
+// Status implements Limiter. It returns current rate limit state for the /status endpoint.
+func (rl *TwitchRateLimiter) Status() LimiterStatus {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	return rl.tokensRemaining, time.Until(rl.resetTime)
+	return LimiterStatus{
+		Name:            "global",
+		TokensRemaining: rl.tokensRemaining,
+		ResetIn:         time.Until(rl.resetTime),
+	}
+}
+
+// GetStatus returns the current token count and time until reset.
+// Kept for backwards compatibility with existing tests.
+func (rl *TwitchRateLimiter) GetStatus() (remaining int, resetIn time.Duration) {
+	s := rl.Status()
+	return s.TokensRemaining, s.ResetIn
 }

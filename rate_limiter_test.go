@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -38,7 +39,11 @@ func TestUpdateFromHeaders_ValidInput(t *testing.T) {
 	// Set up a future reset time
 	futureTime := time.Now().Add(30 * time.Second).Unix()
 
-	rl.UpdateFromHeaders("500", "800", fmt.Sprintf("%d", futureTime))
+	h := http.Header{}
+	h.Set("Ratelimit-Remaining", "500")
+	h.Set("Ratelimit-Limit", "800")
+	h.Set("Ratelimit-Reset", fmt.Sprintf("%d", futureTime))
+	rl.UpdateFromHeaders(h)
 
 	// The update should be applied since it's a valid future time
 	// Note: This test might not change values if bucket logic prevents it
@@ -50,7 +55,10 @@ func TestUpdateFromHeaders_InvalidRemaining(t *testing.T) {
 	initialRemaining := rl.tokensRemaining
 
 	// Test with invalid remaining value
-	rl.UpdateFromHeaders("invalid", "800", "")
+	h := http.Header{}
+	h.Set("Ratelimit-Remaining", "invalid")
+	h.Set("Ratelimit-Limit", "800")
+	rl.UpdateFromHeaders(h)
 
 	// Should not change the value
 	if rl.tokensRemaining != initialRemaining {
@@ -64,7 +72,11 @@ func TestUpdateFromHeaders_NegativeRemaining(t *testing.T) {
 
 	// Test with negative remaining value
 	futureTime := time.Now().Add(30 * time.Second).Unix()
-	rl.UpdateFromHeaders("-10", "800", fmt.Sprintf("%d", futureTime))
+	h := http.Header{}
+	h.Set("Ratelimit-Remaining", "-10")
+	h.Set("Ratelimit-Limit", "800")
+	h.Set("Ratelimit-Reset", fmt.Sprintf("%d", futureTime))
+	rl.UpdateFromHeaders(h)
 
 	// Should not change the value
 	if rl.tokensRemaining != initialRemaining {
@@ -77,7 +89,7 @@ func TestUpdateFromHeaders_EmptyStrings(t *testing.T) {
 	initialRemaining := rl.tokensRemaining
 
 	// Test with empty strings
-	rl.UpdateFromHeaders("", "", "")
+	rl.UpdateFromHeaders(http.Header{})
 
 	// Should not change anything
 	if rl.tokensRemaining != initialRemaining {
@@ -91,7 +103,11 @@ func TestUpdateFromHeaders_PastResetTime(t *testing.T) {
 
 	// Test with past reset time
 	pastTime := time.Now().Add(-30 * time.Second).Unix()
-	rl.UpdateFromHeaders("500", "800", fmt.Sprintf("%d", pastTime))
+	h := http.Header{}
+	h.Set("Ratelimit-Remaining", "500")
+	h.Set("Ratelimit-Limit", "800")
+	h.Set("Ratelimit-Reset", fmt.Sprintf("%d", pastTime))
+	rl.UpdateFromHeaders(h)
 
 	// Should not update with past time
 	if rl.tokensRemaining != initialRemaining {
