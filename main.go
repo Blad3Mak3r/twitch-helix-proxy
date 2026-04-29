@@ -41,13 +41,13 @@ func main() {
 	registry := buildEndpointRegistry()
 
 	proxy := NewTwitchProxy(auth, globalLimiter, registry, clientID)
-
-	// --- HTTP server ---
+	igdbProxy := NewIgdbProxy(auth, clientID, NewIgdbRateLimiter())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", HealthCheck)
-	mux.HandleFunc("/status", StatusHandler(proxy))
+	mux.HandleFunc("/status", StatusHandler(proxy, igdbProxy))
 	mux.Handle("/helix/", proxy)
+	mux.Handle("/igdb/", igdbProxy)
 
 	srv := &http.Server{
 		Addr:    addr,
@@ -57,6 +57,7 @@ func main() {
 	logger.Info("twitch proxy starting",
 		"addr", addr,
 		"helix_endpoint", "http://localhost"+addr+"/helix/...",
+		"igdb_endpoint", "http://localhost"+addr+"/igdb/...",
 		"status_endpoint", "http://localhost"+addr+"/status")
 
 	go func() {

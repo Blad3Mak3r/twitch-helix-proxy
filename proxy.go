@@ -57,16 +57,17 @@ func HealthCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 // StatusHandler returns current proxy status without exposing internal mutexes.
-func StatusHandler(proxy *TwitchProxy) http.HandlerFunc {
+func StatusHandler(proxy *TwitchProxy, igdbProxy *IgdbProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		s := proxy.limiter.Status()
+		helix := proxy.limiter.Status()
+		igdb := igdbProxy.rateLimiter.Status()
 		tokenRenewalIn := proxy.auth.TokenExpiresIn()
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w,
-			`{"tokens_remaining":%d,"reset_in_seconds":%.1f,"token_renewal_in_seconds":%.1f}`,
-			s.TokensRemaining, s.ResetIn.Seconds(), tokenRenewalIn.Seconds())
+			`{"helix":{"tokens_remaining":%d,"reset_in_seconds":%.1f},"igdb":{"tokens_remaining":%d,"reset_in_seconds":%.1f},"token_renewal_in_seconds":%.1f}`,
+			helix.TokensRemaining, helix.ResetIn.Seconds(), igdb.TokensRemaining, igdb.ResetIn.Seconds(), tokenRenewalIn.Seconds())
 	}
 }
 
